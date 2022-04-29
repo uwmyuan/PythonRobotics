@@ -1,10 +1,12 @@
 """
 
 Path tracking simulation with iterative linear model predictive control for speed and steer control
+速度和转向控制的迭代线性模型预测控制算法及路径跟踪仿真
 
 author: Atsushi Sakai (@Atsushi_twi)
-
+comment: Yun Yuan (@uwmyuan)
 """
+from statistics import variance
 import matplotlib.pyplot as plt
 import cvxpy
 import math
@@ -12,58 +14,59 @@ import numpy as np
 import sys
 import os
 
-sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
-                "/../../PathPlanning/CubicSpline/")
+sys.path.append(
+    os.path.dirname(os.path.abspath(__file__)) + "/../../PathPlanning/CubicSpline/"
+)
 
 try:
-    import cubic_spline_planner
+    import cubic_spline_planner  # 这里以三次样条曲线路径规划器为例，也可以更换其他规划算法
 except:
     raise
 
 
-NX = 4  # x = x, y, v, yaw
-NU = 2  # a = [accel, steer]
-T = 5  # horizon length
+NX = 4  # x = x, y, v, yaw 状态空间维度 包括x轴 y轴 线速度 偏航（朝向）
+NU = 2  # a = [accel, steer]  控制空间维度 包括加速度和加角速度
+T = 5  # horizon length 预测时间窗宽度
 
-# mpc parameters
-R = np.diag([0.01, 0.01])  # input cost matrix
-Rd = np.diag([0.01, 1.0])  # input difference cost matrix
-Q = np.diag([1.0, 1.0, 0.5, 0.5])  # state cost matrix
-Qf = Q  # state final matrix
-GOAL_DIS = 1.5  # goal distance
-STOP_SPEED = 0.5 / 3.6  # stop speed
-MAX_TIME = 500.0  # max simulation time
+# mpc parameters 模型预测控制参数
+R = np.diag([0.01, 0.01])  # input cost matrix 输入成本矩阵
+Rd = np.diag([0.01, 1.0])  # input difference cost matrix 输入不同的状态
+Q = np.diag([1.0, 1.0, 0.5, 0.5])  # state cost matrix 状态成本矩阵
+Qf = Q  # state final matrix 状态矩阵
+GOAL_DIS = 1.5  # goal distance 与目标点的距离阈值 m
+STOP_SPEED = 0.5 / 3.6  # stop speed 停止速度 除以3.6单位转化为m/s
+MAX_TIME = 100.0  # max simulation time 最大仿真时间
 
-# iterative paramter
-MAX_ITER = 3  # Max iteration
-DU_TH = 0.1  # iteration finish param
+# iterative paramter 迭代终止条件参数
+MAX_ITER = 3  # Max iteration 最大迭代次数
+DU_TH = 0.1  # iteration finish param 连续两次结果之差的阈值
 
-TARGET_SPEED = 10.0 / 3.6  # [m/s] target speed
+TARGET_SPEED = 10.0 / 3.6  # [m/s] target speed 巡航速度 单位m/s
 N_IND_SEARCH = 10  # Search index number
 
-DT = 0.2  # [s] time tick
+DT = 0.2  # [s] time tick 仿真时钟单位
 
-# Vehicle parameters
-LENGTH = 4.5  # [m]
-WIDTH = 2.0  # [m]
-BACKTOWHEEL = 1.0  # [m]
-WHEEL_LEN = 0.3  # [m]
-WHEEL_WIDTH = 0.2  # [m]
-TREAD = 0.7  # [m]
-WB = 2.5  # [m]
+# Vehicle parameters 车辆参数
+LENGTH = 4.5  # [m] 长
+WIDTH = 2.0  # [m] 宽
+BACKTOWHEEL = 1.0  # [m] 后轮
+WHEEL_LEN = 0.3  # [m] 轮子长
+WHEEL_WIDTH = 0.2  # [m] 轮宽
+TREAD = 0.7  # [m] 胎面
+WB = 2.5  # [m] 轴距
 
-MAX_STEER = np.deg2rad(45.0)  # maximum steering angle [rad]
-MAX_DSTEER = np.deg2rad(30.0)  # maximum steering speed [rad/s]
-MAX_SPEED = 55.0 / 3.6  # maximum speed [m/s]
-MIN_SPEED = -20.0 / 3.6  # minimum speed [m/s]
-MAX_ACCEL = 1.0  # maximum accel [m/ss]
+MAX_STEER = np.deg2rad(45.0)  # maximum steering angle [rad] 最大转角
+MAX_DSTEER = np.deg2rad(30.0)  # maximum steering speed [rad/s] 最大角速度
+MAX_SPEED = 55.0 / 3.6  # maximum speed [m/s] 最大速度
+MIN_SPEED = -20.0 / 3.6  # minimum speed [m/s] 最大倒车速度
+MAX_ACCEL = 1.0  # maximum accel [m/ss] 最大加速度
 
-show_animation = True
+show_animation = True  # 是否展示仿真动画选项
 
 
 class State:
     """
-    vehicle state class
+    vehicle state class 车辆状态
     """
 
     def __init__(self, x=0.0, y=0.0, yaw=0.0, v=0.0):
@@ -75,24 +78,24 @@ class State:
 
 
 def pi_2_pi(angle):
-    while(angle > math.pi):
+    while angle > math.pi:
         angle = angle - 2.0 * math.pi
 
-    while(angle < -math.pi):
+    while angle < -math.pi:
         angle = angle + 2.0 * math.pi
 
     return angle
 
 
 def get_linear_model_matrix(v, phi, delta):
-
+    # 线性动力学模型的矩阵形式 
     A = np.zeros((NX, NX))
     A[0, 0] = 1.0
     A[1, 1] = 1.0
     A[2, 2] = 1.0
     A[3, 3] = 1.0
     A[0, 2] = DT * math.cos(phi)
-    A[0, 3] = - DT * v * math.sin(phi)
+    A[0, 3] = -DT * v * math.sin(phi)
     A[1, 2] = DT * math.sin(phi)
     A[1, 3] = DT * v * math.cos(phi)
     A[3, 2] = DT * math.tan(delta) / WB
@@ -103,19 +106,43 @@ def get_linear_model_matrix(v, phi, delta):
 
     C = np.zeros(NX)
     C[0] = DT * v * math.sin(phi) * phi
-    C[1] = - DT * v * math.cos(phi) * phi
-    C[3] = - DT * v * delta / (WB * math.cos(delta) ** 2)
+    C[1] = -DT * v * math.cos(phi) * phi
+    C[3] = -DT * v * delta / (WB * math.cos(delta) ** 2)
 
     return A, B, C
 
 
-def plot_car(x, y, yaw, steer=0.0, cabcolor="-r", truckcolor="-k"):  # pragma: no cover
+def plot_car(
+    ax, x, y, yaw, steer=0.0, cabcolor="-r", truckcolor="-k"
+):  # pragma: no cover
+    """
+    用简单的线条绘制车辆
+    """
+    outline = np.array(
+        [
+            [
+                -BACKTOWHEEL,
+                (LENGTH - BACKTOWHEEL),
+                (LENGTH - BACKTOWHEEL),
+                -BACKTOWHEEL,
+                -BACKTOWHEEL,
+            ],
+            [WIDTH / 2, WIDTH / 2, -WIDTH / 2, -WIDTH / 2, WIDTH / 2],
+        ]
+    )
 
-    outline = np.array([[-BACKTOWHEEL, (LENGTH - BACKTOWHEEL), (LENGTH - BACKTOWHEEL), -BACKTOWHEEL, -BACKTOWHEEL],
-                        [WIDTH / 2, WIDTH / 2, - WIDTH / 2, -WIDTH / 2, WIDTH / 2]])
-
-    fr_wheel = np.array([[WHEEL_LEN, -WHEEL_LEN, -WHEEL_LEN, WHEEL_LEN, WHEEL_LEN],
-                         [-WHEEL_WIDTH - TREAD, -WHEEL_WIDTH - TREAD, WHEEL_WIDTH - TREAD, WHEEL_WIDTH - TREAD, -WHEEL_WIDTH - TREAD]])
+    fr_wheel = np.array(
+        [
+            [WHEEL_LEN, -WHEEL_LEN, -WHEEL_LEN, WHEEL_LEN, WHEEL_LEN],
+            [
+                -WHEEL_WIDTH - TREAD,
+                -WHEEL_WIDTH - TREAD,
+                WHEEL_WIDTH - TREAD,
+                WHEEL_WIDTH - TREAD,
+                -WHEEL_WIDTH - TREAD,
+            ],
+        ]
+    )
 
     rr_wheel = np.copy(fr_wheel)
 
@@ -124,10 +151,10 @@ def plot_car(x, y, yaw, steer=0.0, cabcolor="-r", truckcolor="-k"):  # pragma: n
     rl_wheel = np.copy(rr_wheel)
     rl_wheel[1, :] *= -1
 
-    Rot1 = np.array([[math.cos(yaw), math.sin(yaw)],
-                     [-math.sin(yaw), math.cos(yaw)]])
-    Rot2 = np.array([[math.cos(steer), math.sin(steer)],
-                     [-math.sin(steer), math.cos(steer)]])
+    Rot1 = np.array([[math.cos(yaw), math.sin(yaw)], [-math.sin(yaw), math.cos(yaw)]])
+    Rot2 = np.array(
+        [[math.cos(steer), math.sin(steer)], [-math.sin(steer), math.cos(steer)]]
+    )
 
     fr_wheel = (fr_wheel.T.dot(Rot2)).T
     fl_wheel = (fl_wheel.T.dot(Rot2)).T
@@ -152,20 +179,36 @@ def plot_car(x, y, yaw, steer=0.0, cabcolor="-r", truckcolor="-k"):  # pragma: n
     rl_wheel[0, :] += x
     rl_wheel[1, :] += y
 
-    plt.plot(np.array(outline[0, :]).flatten(),
-             np.array(outline[1, :]).flatten(), truckcolor)
-    plt.plot(np.array(fr_wheel[0, :]).flatten(),
-             np.array(fr_wheel[1, :]).flatten(), truckcolor)
-    plt.plot(np.array(rr_wheel[0, :]).flatten(),
-             np.array(rr_wheel[1, :]).flatten(), truckcolor)
-    plt.plot(np.array(fl_wheel[0, :]).flatten(),
-             np.array(fl_wheel[1, :]).flatten(), truckcolor)
-    plt.plot(np.array(rl_wheel[0, :]).flatten(),
-             np.array(rl_wheel[1, :]).flatten(), truckcolor)
-    plt.plot(x, y, "*")
+    ax.plot(
+        np.array(outline[0, :]).flatten(), np.array(outline[1, :]).flatten(), truckcolor
+    )
+    ax.plot(
+        np.array(fr_wheel[0, :]).flatten(),
+        np.array(fr_wheel[1, :]).flatten(),
+        truckcolor,
+    )
+    ax.plot(
+        np.array(rr_wheel[0, :]).flatten(),
+        np.array(rr_wheel[1, :]).flatten(),
+        truckcolor,
+    )
+    ax.plot(
+        np.array(fl_wheel[0, :]).flatten(),
+        np.array(fl_wheel[1, :]).flatten(),
+        truckcolor,
+    )
+    ax.plot(
+        np.array(rl_wheel[0, :]).flatten(),
+        np.array(rl_wheel[1, :]).flatten(),
+        truckcolor,
+    )
+    ax.plot(x, y, "*")
 
 
 def update_state(state, a, delta):
+    """
+    更新状态
+    """
 
     # input check
     if delta >= MAX_STEER:
@@ -191,9 +234,12 @@ def get_nparray_from_matrix(x):
 
 
 def calc_nearest_index(state, cx, cy, cyaw, pind):
+    """
+    找到最近的航迹点序号
+    """
 
-    dx = [state.x - icx for icx in cx[pind:(pind + N_IND_SEARCH)]]
-    dy = [state.y - icy for icy in cy[pind:(pind + N_IND_SEARCH)]]
+    dx = [state.x - icx for icx in cx[pind : (pind + N_IND_SEARCH)]]
+    dy = [state.y - icy for icy in cy[pind : (pind + N_IND_SEARCH)]]
 
     d = [idx ** 2 + idy ** 2 for (idx, idy) in zip(dx, dy)]
 
@@ -214,6 +260,9 @@ def calc_nearest_index(state, cx, cy, cyaw, pind):
 
 
 def predict_motion(x0, oa, od, xref):
+    """
+    计算当前时间窗车辆状态
+    """
     xbar = xref * 0.0
     for i, _ in enumerate(x0):
         xbar[i, 0] = x0[i]
@@ -232,6 +281,7 @@ def predict_motion(x0, oa, od, xref):
 def iterative_linear_mpc_control(xref, x0, dref, oa, od):
     """
     MPC contorl with updating operational point iteraitvely
+    迭代更新操作点
     """
 
     if oa is None or od is None:
@@ -253,12 +303,12 @@ def iterative_linear_mpc_control(xref, x0, dref, oa, od):
 
 def linear_mpc_control(xref, xbar, x0, dref):
     """
-    linear mpc control
+    linear mpc control 线性MPC控制
 
-    xref: reference point
-    xbar: operational point
-    x0: initial state
-    dref: reference steer angle
+    xref: reference point 参考点
+    xbar: operational point 操作点
+    x0: initial state 初始状态
+    dref: reference steer angle 参考转向角
     """
 
     x = cvxpy.Variable((NX, T + 1))
@@ -273,14 +323,12 @@ def linear_mpc_control(xref, xbar, x0, dref):
         if t != 0:
             cost += cvxpy.quad_form(xref[:, t] - x[:, t], Q)
 
-        A, B, C = get_linear_model_matrix(
-            xbar[2, t], xbar[3, t], dref[0, t])
+        A, B, C = get_linear_model_matrix(xbar[2, t], xbar[3, t], dref[0, t])
         constraints += [x[:, t + 1] == A @ x[:, t] + B @ u[:, t] + C]
 
         if t < (T - 1):
             cost += cvxpy.quad_form(u[:, t + 1] - u[:, t], Rd)
-            constraints += [cvxpy.abs(u[1, t + 1] - u[1, t]) <=
-                            MAX_DSTEER * DT]
+            constraints += [cvxpy.abs(u[1, t + 1] - u[1, t]) <= MAX_DSTEER * DT]
 
     cost += cvxpy.quad_form(xref[:, T] - x[:, T], Qf)
 
@@ -309,6 +357,9 @@ def linear_mpc_control(xref, xbar, x0, dref):
 
 
 def calc_ref_trajectory(state, cx, cy, cyaw, ck, sp, dl, pind):
+    """
+    计算参考轨迹
+    """
     xref = np.zeros((NX, T + 1))
     dref = np.zeros((1, T + 1))
     ncourse = len(cx)
@@ -347,18 +398,20 @@ def calc_ref_trajectory(state, cx, cy, cyaw, ck, sp, dl, pind):
 
 
 def check_goal(state, goal, tind, nind):
-
+    """
+    检查全局终止条件
+    """
     # check goal
     dx = state.x - goal[0]
     dy = state.y - goal[1]
     d = math.hypot(dx, dy)
 
-    isgoal = (d <= GOAL_DIS)
+    isgoal = d <= GOAL_DIS
 
     if abs(tind - nind) >= 5:
         isgoal = False
 
-    isstop = (abs(state.v) <= STOP_SPEED)
+    isstop = abs(state.v) <= STOP_SPEED
 
     if isgoal and isstop:
         return True
@@ -368,22 +421,23 @@ def check_goal(state, goal, tind, nind):
 
 def do_simulation(cx, cy, cyaw, ck, sp, dl, initial_state):
     """
-    Simulation
+    Simulation 仿真主函数
 
-    cx: course x position list
-    cy: course y position list
-    cy: course yaw position list
-    ck: course curvature list
-    sp: speed profile
-    dl: course tick [m]
+    cx: course x position list 规划x坐标
+    cy: course y position list 规划y坐标
+    cyaw: course yaw position list 规划朝向
+    ck: course curvature list 规划曲率
+    sp: speed profile 规划速度
+    dl: course tick [m] 样条线参数
 
     """
+    plt_flag = True #画图用
 
-    goal = [cx[-1], cy[-1]]
+    goal = [cx[-1], cy[-1]] #设定目标点为最后一个航迹点
 
     state = initial_state
 
-    # initial yaw compensation
+    # initial yaw compensation 初始化朝向值
     if state.yaw - cyaw[0] >= math.pi:
         state.yaw -= math.pi * 2.0
     elif state.yaw - cyaw[0] <= -math.pi:
@@ -397,6 +451,7 @@ def do_simulation(cx, cy, cyaw, ck, sp, dl, initial_state):
     t = [0.0]
     d = [0.0]
     a = [0.0]
+
     target_ind, _ = calc_nearest_index(state, cx, cy, cyaw, 0)
 
     odelta, oa = None, None
@@ -404,17 +459,22 @@ def do_simulation(cx, cy, cyaw, ck, sp, dl, initial_state):
     cyaw = smooth_yaw(cyaw)
 
     while MAX_TIME >= time:
+        # 计算参考轨迹
         xref, target_ind, dref = calc_ref_trajectory(
-            state, cx, cy, cyaw, ck, sp, dl, target_ind)
+            state, cx, cy, cyaw, ck, sp, dl, target_ind
+        )
 
-        x0 = [state.x, state.y, state.v, state.yaw]  # current state
+        x0 = [state.x, state.y, state.v, state.yaw]  # current state 
 
+        # MPC算法主函数
         oa, odelta, ox, oy, oyaw, ov = iterative_linear_mpc_control(
-            xref, x0, dref, oa, odelta)
+            xref, x0, dref, oa, odelta
+        ) 
 
         if odelta is not None:
             di, ai = odelta[0], oa[0]
 
+        # 更新仿真状态
         state = update_state(state, ai, di)
         time = time + DT
 
@@ -431,28 +491,71 @@ def do_simulation(cx, cy, cyaw, ck, sp, dl, initial_state):
             break
 
         if show_animation:  # pragma: no cover
-            plt.cla()
-            # for stopping simulation with the esc key.
-            plt.gcf().canvas.mpl_connect('key_release_event',
-                    lambda event: [exit(0) if event.key == 'escape' else None])
+
+            if plt_flag:
+                fig = plt.figure(figsize=(24, 7))
+                plt_flag = False
+            else:
+                fig = plt.gcf()
+                fig.clear()
+            # for stopping simulation with the esc key. 按ESE停止程序
+            fig.canvas.mpl_connect(
+                "key_release_event",
+                lambda event: [exit(0) if event.key == "escape" else None],
+            )
+            
+            ax1 = fig.add_subplot(1, 3, 1)
             if ox is not None:
-                plt.plot(ox, oy, "xr", label="MPC")
-            plt.plot(cx, cy, "-r", label="course")
-            plt.plot(x, y, "ob", label="trajectory")
-            plt.plot(xref[0, :], xref[1, :], "xk", label="xref")
-            plt.plot(cx[target_ind], cy[target_ind], "xg", label="target")
-            plot_car(state.x, state.y, state.yaw, steer=di)
-            plt.axis("equal")
-            plt.grid(True)
-            plt.title("Time[s]:" + str(round(time, 2))
-                      + ", speed[km/h]:" + str(round(state.v * 3.6, 2)))
+                ax1.plot(ox, oy, "xr", label="MPC")
+            ax1.plot(cx, cy, "-r", label="course")
+            ax1.plot(x, y, "ob", label="trajectory")
+            ax1.plot(xref[0, :], xref[1, :], "xk", label="xref")
+            ax1.plot(cx[target_ind], cy[target_ind], "xg", label="target")
+            plot_car(ax1, state.x, state.y, state.yaw, steer=di)
+            ax1.grid(True)
+            ax1.set_title(
+                "Time [s]:"
+                + str(round(time, 2))
+                + ", speed [km/h]:"
+                + str(round(state.v * 3.6, 2))
+            )
+            ax1.set_aspect("equal", "box")
+            ax1.set_xlabel("x [m]")
+            ax1.set_ylabel("y [m]")
+            ax1.legend()
+            ax1.set_title("Vehicle trajectory")
+
+            # 绘制速度曲线
+            ax2 = fig.add_subplot(1, 3, 2)
+            ax2.plot(t, v, "-r", label="speed")
+            ax2.grid(True)
+            ax2.set_xlabel("Time [s]")
+            ax2.set_ylabel("Speed [km/h]")
+            ax2.set_xlim([-5, MAX_TIME])
+            ax2.set_ylim([MIN_SPEED - 1, MAX_SPEED + 1])
+            ax2.set_title("Speed profile")
+
+            # 绘制加速度曲线
+            ax3 = fig.add_subplot(1, 3, 3)
+            # 绘制速度曲线
+            ax3.plot(t, a, "-r", label="acc")
+            ax3.grid(True)
+            ax3.set_xlabel("Time [s]")
+            ax3.set_ylabel("Acceleration [$m/s^2$]")
+            ax3.set_title("Acceleration profile")
+            ax3.set_xlim([-5, MAX_TIME])
+            # ax3.set_ylim([-5, MAX_ACCEL + 1])
+
+
             plt.pause(0.0001)
 
     return t, x, y, yaw, v, d, a
 
 
 def calc_speed_profile(cx, cy, cyaw, target_speed):
-
+    """
+    计算速度
+    """
     speed_profile = [target_speed] * len(cx)
     direction = 1.0  # forward
 
@@ -471,7 +574,7 @@ def calc_speed_profile(cx, cy, cyaw, target_speed):
                 direction = 1.0
 
         if direction != 1.0:
-            speed_profile[i] = - target_speed
+            speed_profile[i] = -target_speed
         else:
             speed_profile[i] = target_speed
 
@@ -481,7 +584,9 @@ def calc_speed_profile(cx, cy, cyaw, target_speed):
 
 
 def smooth_yaw(yaw):
-
+    """
+    朝向平滑化
+    """
     for i in range(len(yaw) - 1):
         dyaw = yaw[i + 1] - yaw[i]
 
@@ -499,8 +604,7 @@ def smooth_yaw(yaw):
 def get_straight_course(dl):
     ax = [0.0, 5.0, 10.0, 20.0, 30.0, 40.0, 50.0]
     ay = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
-    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
 
     return cx, cy, cyaw, ck
 
@@ -508,8 +612,7 @@ def get_straight_course(dl):
 def get_straight_course2(dl):
     ax = [0.0, -10.0, -20.0, -40.0, -50.0, -60.0, -70.0]
     ay = [0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0]
-    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
 
     return cx, cy, cyaw, ck
 
@@ -517,8 +620,7 @@ def get_straight_course2(dl):
 def get_straight_course3(dl):
     ax = [0.0, -10.0, -20.0, -40.0, -50.0, -60.0, -70.0]
     ay = [0.0, -1.0, 1.0, 0.0, -1.0, 1.0, 0.0]
-    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
 
     cyaw = [i - math.pi for i in cyaw]
 
@@ -528,22 +630,24 @@ def get_straight_course3(dl):
 def get_forward_course(dl):
     ax = [0.0, 60.0, 125.0, 50.0, 75.0, 30.0, -10.0]
     ay = [0.0, 0.0, 50.0, 65.0, 30.0, 50.0, -20.0]
-    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
 
     return cx, cy, cyaw, ck
 
 
 def get_switch_back_course(dl):
+    # 第一段航迹点
     ax = [0.0, 30.0, 6.0, 20.0, 35.0]
     ay = [0.0, 0.0, 20.0, 35.0, 20.0]
-    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    # 第一段样条线
+    cx, cy, cyaw, ck, s = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
+    # 第二段航迹点
     ax = [35.0, 10.0, 0.0, 0.0]
     ay = [20.0, 30.0, 5.0, 0.0]
-    cx2, cy2, cyaw2, ck2, s2 = cubic_spline_planner.calc_spline_course(
-        ax, ay, ds=dl)
+    # 第二段样条线
+    cx2, cy2, cyaw2, ck2, s2 = cubic_spline_planner.calc_spline_course(ax, ay, ds=dl)
     cyaw2 = [i - math.pi for i in cyaw2]
+    # 连接两段
     cx.extend(cx2)
     cy.extend(cy2)
     cyaw.extend(cyaw2)
@@ -554,74 +658,100 @@ def get_switch_back_course(dl):
 
 def main():
     print(__file__ + " start!!")
+    print("Press ESE to stop simulation")
 
-    dl = 1.0  # course tick
+    dl = 1.0  # course tick 样条线参数
     # cx, cy, cyaw, ck = get_straight_course(dl)
     # cx, cy, cyaw, ck = get_straight_course2(dl)
     # cx, cy, cyaw, ck = get_straight_course3(dl)
     # cx, cy, cyaw, ck = get_forward_course(dl)
-    cx, cy, cyaw, ck = get_switch_back_course(dl)
+    cx, cy, cyaw, ck = get_switch_back_course(dl)  # 调用路径规划模块 输出x坐标 y坐标 朝向 曲率
 
-    sp = calc_speed_profile(cx, cy, cyaw, TARGET_SPEED)
+    sp = calc_speed_profile(cx, cy, cyaw, TARGET_SPEED)  # 规划速度曲线
 
-    initial_state = State(x=cx[0], y=cy[0], yaw=cyaw[0], v=0.0)
+    initial_state = State(x=cx[0], y=cy[0], yaw=cyaw[0], v=0.0)  # 设定初始状态
 
     t, x, y, yaw, v, d, a = do_simulation(
-        cx, cy, cyaw, ck, sp, dl, initial_state)
+        cx, cy, cyaw, ck, sp, dl, initial_state
+    )  # 开始仿真 
 
+    # 结果绘图
     if show_animation:  # pragma: no cover
         plt.close("all")
-        plt.subplots()
-        plt.plot(cx, cy, "-r", label="spline")
-        plt.plot(x, y, "-g", label="tracking")
-        plt.grid(True)
-        plt.axis("equal")
-        plt.xlabel("x[m]")
-        plt.ylabel("y[m]")
-        plt.legend()
 
-        plt.subplots()
-        plt.plot(t, v, "-r", label="speed")
-        plt.grid(True)
-        plt.xlabel("Time [s]")
-        plt.ylabel("Speed [kmh]")
+        fig = plt.figure(figsize=(24, 7))
+        fig.canvas.mpl_connect(
+            "key_release_event",
+            lambda event: [exit(0) if event.key == "escape" else None],
+        )
+        ax1 = fig.add_subplot(1, 3, 1)
+        # 绘制样条线
+        ax1.plot(cx, cy, "-r", label="Planned")
+        # 绘制轨迹
+        ax1.plot(x, y, "-g", label="Actual")
+        ax1.grid(True)
+        ax1.set_aspect("equal", "box")
+        ax1.set_xlabel("x[m]")
+        ax1.set_ylabel("y[m]")
+        ax1.set_title("Vehicle Trajectory")
+        ax1.legend()
+
+        ax2 = fig.add_subplot(1, 3, 2)
+        # 绘制速度曲线
+        ax2.plot(t, v, "-r", label="speed")
+        ax2.grid(True)
+        ax2.set_xlabel("Time [s]")
+        ax2.set_ylabel("Speed [km/h]")
+        ax2.set_title("Speed profile")
+        # ax2.set_xlim([-5, MAX_TIME])
+        # ax2.set_ylim([MIN_SPEED - 1, MAX_SPEED + 1])
+        
+        # 绘制加速度曲线
+        ax3 = fig.add_subplot(1, 3, 3)
+        ax3.plot(t, a, "-r", label="acc")
+        ax3.grid(True)
+        ax3.set_xlabel("Time [s]")
+        ax3.set_ylabel("Acceleration [$m/s^2$]")
+        ax3.set_title("Acceleration profile")
+        # ax2.set_xlim([-5, MAX_TIME])
+        # ax3.set_ylim([-5, MAX_ACCEL + 1])
 
         plt.show()
 
 
-def main2():
-    print(__file__ + " start!!")
+# def main2():
+#     print(__file__ + " start!!")
 
-    dl = 1.0  # course tick
-    cx, cy, cyaw, ck = get_straight_course3(dl)
+#     dl = 1.0  # course tick
+#     cx, cy, cyaw, ck = get_straight_course3(dl)
 
-    sp = calc_speed_profile(cx, cy, cyaw, TARGET_SPEED)
+#     sp = calc_speed_profile(cx, cy, cyaw, TARGET_SPEED)
 
-    initial_state = State(x=cx[0], y=cy[0], yaw=0.0, v=0.0)
+#     initial_state = State(x=cx[0], y=cy[0], yaw=0.0, v=0.0)
 
-    t, x, y, yaw, v, d, a = do_simulation(
-        cx, cy, cyaw, ck, sp, dl, initial_state)
+#     t, x, y, yaw, v, d, a = do_simulation(
+#         cx, cy, cyaw, ck, sp, dl, initial_state)
 
-    if show_animation:  # pragma: no cover
-        plt.close("all")
-        plt.subplots()
-        plt.plot(cx, cy, "-r", label="spline")
-        plt.plot(x, y, "-g", label="tracking")
-        plt.grid(True)
-        plt.axis("equal")
-        plt.xlabel("x[m]")
-        plt.ylabel("y[m]")
-        plt.legend()
+#     if show_animation:  # pragma: no cover
+#         plt.close("all")
+#         plt.subplots()
+#         plt.plot(cx, cy, "-r", label="spline")
+#         plt.plot(x, y, "-g", label="tracking")
+#         plt.grid(True)
+#         plt.axis("equal")
+#         plt.xlabel("x[m]")
+#         plt.ylabel("y[m]")
+#         plt.legend()
 
-        plt.subplots()
-        plt.plot(t, v, "-r", label="speed")
-        plt.grid(True)
-        plt.xlabel("Time [s]")
-        plt.ylabel("Speed [kmh]")
+#         plt.subplots()
+#         plt.plot(t, v, "-r", label="speed")
+#         plt.grid(True)
+#         plt.xlabel("Time [s]")
+#         plt.ylabel("Speed [kmh]")
 
-        plt.show()
+#         plt.show()
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
     # main2()
